@@ -1,0 +1,41 @@
+# Source
+src/
+tests/
+examples/
+docs/
+
+# Config files
+.eslintrc
+.prettierrc
+jest.config.js
+tsconfig.json
+.github/
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# Development files
+.env
+.env.*
+coverage/
+.husky/
+.git/
+.gitignore
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# Build process
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test files
+__tests__/
+*.test.ts
+*.spec.ts 

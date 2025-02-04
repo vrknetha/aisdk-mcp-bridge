@@ -1,0 +1,39 @@
+{
+  "mcpServers": {
+    "http-server": {
+      "command": "ts-node",
+      "args": ["examples/http-server.ts"],
+      "mode": "http",
+      "port": 3002,
+      "env": {
+        "NODE_ENV": "development",
+        "MCP_SERVER_PORT": "3002"
+      }
+    },
+    "sse-server": {
+      "command": "ts-node",
+      "args": ["examples/sse-server.ts"],
+      "mode": "sse",
+      "sseOptions": {
+        "endpoint": "http://localhost:3003/events",
+        "headers": {
+          "Authorization": "Bearer test-token"
+        },
+        "reconnectTimeout": 5000
+      },
+      "env": {
+        "NODE_ENV": "development",
+        "MCP_SERVER_PORT": "3003"
+      }
+    },
+    "firecrawl": {
+      "command": "npx",
+      "args": ["-y", "mcp-server-firecrawl"],
+      "mode": "stdio",
+      "env": {
+        "FIRE_CRAWL_API_KEY": "fc-3289d22583d14760b3a695a428a8ab35",
+        "FIRE_CRAWL_API_URL": "http://localhost:3002"
+      }
+    }
+  }
+}
