@@ -1,107 +1,71 @@
 import { generateText } from 'ai';
 import { google } from '@ai-sdk/google';
-import { getMcpTools, cleanupMcp, initializeMcp } from '../src';
+import { getMcpTools, initializeMcp, cleanupMcp } from '../src';
+
 import dotenv from 'dotenv';
 dotenv.config();
 
-async function runTest() {
+async function main() {
   try {
-    console.log('Starting MCP test...');
-
     // Initialize MCP
     await initializeMcp({ debug: true });
 
-    // Get MCP tools
-    const tools = await getMcpTools({ serverName: 'firecrawl' });
-
-    // Use tools with generateText - let the LLM figure out tool usage
-    const result = await generateText({
-      model: google('gemini-1.5-pro'),
-      prompt:
-        'Please analyze the current trennds using https://www.techtarget.com/searchenterpriseai/tip/9-top-AI-and-machine-learning-trends',
-      tools,
+    // Test firecrawl server
+    console.log('\nTesting firecrawl server...');
+    const firecrawlTools = await getMcpTools({ serverName: 'firecrawl' });
+    const firecrawlResult = await generateText({
+      model: google('gemini-1.5-flash'),
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant that analyzes web content.',
+        },
+        {
+          role: 'user',
+          content:
+            'Please analyze the current trends using https://www.techtarget.com/searchenterpriseai/tip/9-top-AI-and-machine-learning-trends',
+        },
+      ],
+      tools: firecrawlTools,
     });
-    console.log('Result:', result.text);
-    return true;
+    console.log('Firecrawl test result:', firecrawlResult.text);
+
+    // Test SSE server
+    console.log('\nTesting SSE server...');
+    const sseTools = await getMcpTools({ serverName: 'sse-server' });
+    const sseResult = await generateText({
+      model: google('gemini-1.5-flash'),
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant that manages subscriptions.',
+        },
+        {
+          role: 'user',
+          content: 'Please subscribe to the "test-topic" topic',
+        },
+      ],
+      tools: sseTools,
+    });
+    console.log('SSE test result:', sseResult.text);
   } catch (error) {
-    console.error('Test failed:', error);
-    return false;
+    console.error('Test error:', error);
+    process.exit(1);
   } finally {
-    try {
-      await cleanupMcp();
-    } catch (cleanupError) {
-      console.error('Error during cleanup:', cleanupError);
-    }
+    // Clean up
+    await cleanupMcp();
   }
 }
 
-async function runHttpTest() {
-  try {
-    console.log('Running HTTP server test...');
-
-    // Initialize MCP with HTTP server
-    await initializeMcp();
-
-    // Get tools from HTTP server
-    const tools = await getMcpTools({ serverName: 'http-server' });
-    console.log('HTTP server tools:', tools);
-
-    // Test echo tool using generateText
-    const result = await generateText({
-      model: google('gemini-1.5-pro'),
-      prompt: 'Please echo back the message "Hello from HTTP test!"',
-      tools,
-    });
-    console.log('Echo test result:', result.text);
-
-    console.log('HTTP server test completed successfully');
-    return true;
-  } catch (error) {
-    console.error('HTTP server test failed:', error);
-    return false;
-  } finally {
-    try {
-      await cleanupMcp();
-    } catch (cleanupError) {
-      console.error('Error during cleanup:', cleanupError);
-    }
-  }
-}
-
-async function runSseTest() {
-  console.log('Running SSE server test...');
-  try {
-    // Initialize MCP with SSE server
-    await initializeMcp();
-
-    // Get tools from SSE server
-    const tools = await getMcpTools({ serverName: 'sse-server' });
-    console.log('SSE server tools:', tools);
-
-    // Test subscribe tool using generateText
-    const result = await generateText({
-      model: google('gemini-1.5-pro'),
-      prompt: 'Please subscribe to the "test-topic" topic',
-      tools,
-    });
-    console.log('Subscribe test result:', result.text);
-
-    console.log('SSE server test completed successfully');
-  } catch (error) {
-    console.error('SSE server test failed:', error);
-  }
-}
+// Handle process signals
+process.on('SIGINT', async () => {
+  console.log('\nSIGINT received. Cleaning up...');
+  await cleanupMcp();
+  process.exit(1);
+});
 
 // Run tests
-async function runTests() {
-  const results = await Promise.all([runTest()]);
-  const allPassed = results.every(result => result);
-  process.exit(allPassed ? 0 : 1);
-}
-
-if (require.main === module) {
-  runTests().catch(error => {
-    console.error('Tests failed:', error);
-    process.exit(1);
-  });
-}
+main().catch(error => {
+  console.error('Test failed:', error);
+  process.exit(1);
+});

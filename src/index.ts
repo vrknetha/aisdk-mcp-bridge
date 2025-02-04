@@ -4,6 +4,8 @@ import {
   MCPServerManager,
   type MCPServersConfig,
   type ServerConfig,
+  ServerConfigSchema,
+  MCPServersConfigSchema,
 } from './server';
 import { log } from './tools';
 import path from 'path';
@@ -18,27 +20,6 @@ export type { MCPToolResult } from './service';
 
 // Configuration validation schema
 const AutoApproveSchema = z.array(z.string()).default([]);
-
-const ServerConfigSchema = z.object({
-  command: z.string(),
-  args: z.array(z.string()),
-  mode: z.enum(['http', 'stdio', 'sse']).default('stdio'),
-  env: z.record(z.string()).optional(),
-  autoApprove: AutoApproveSchema.optional(),
-  disabled: z.boolean().optional(),
-  port: z.number().optional(),
-  sseOptions: z
-    .object({
-      endpoint: z.string(),
-      headers: z.record(z.string()).optional(),
-      reconnectTimeout: z.number().optional(),
-    })
-    .optional(),
-});
-
-const MCPConfigSchema = z.object({
-  mcpServers: z.record(ServerConfigSchema),
-});
 
 // Helper to convert ServerConfig to StdioServerParameters
 export function toStdioParams(config: ServerConfig): StdioServerParameters {
@@ -72,7 +53,7 @@ async function loadMcpConfig(configPath: string): Promise<MCPServersConfig> {
   try {
     const configContent = await fs.readFile(configPath, 'utf-8');
     const config = JSON.parse(configContent);
-    return MCPConfigSchema.parse(config);
+    return MCPServersConfigSchema.parse(config);
   } catch (error) {
     log(`Failed to load config from ${configPath}`, error, { type: 'error' });
     throw error;
@@ -125,6 +106,14 @@ export async function initializeMcp(
   } = {}
 ): Promise<void> {
   const { debug = false } = options;
+  const service = MCPService.getInstance();
+
+  // Check if already initialized
+  if (service.isInitialized()) {
+    log('MCP service already initialized', undefined, { debug });
+    return;
+  }
+
   log('Initializing MCP...', undefined, { debug: true });
 
   try {
@@ -138,25 +127,52 @@ export async function initializeMcp(
     const serverManager = MCPServerManager.getInstance(config);
 
     // Initialize MCP service with server manager
-    const service = MCPService.getInstance();
     service.setServerManager(serverManager);
 
     // Start all servers
     const results = await serverManager.startAllServers();
     log('Server startup results:', results, { debug: true });
 
-    // Check if any servers failed to start
-    const failedServers = Array.from(results.entries())
-      .filter(([_, success]) => !success)
-      .map(([name]) => name);
+    // Check server statuses
+    const failedServers = [];
+    const runningServers = [];
+
+    for (const [name, success] of results.entries()) {
+      if (success) {
+        runningServers.push(name);
+        log(`Server ${name} started successfully`, undefined, { type: 'info' });
+      } else {
+        failedServers.push(name);
+        log(`Server ${name} failed to start`, undefined, { type: 'error' });
+      }
+    }
 
     if (failedServers.length > 0) {
-      log(`Failed to start servers: ${failedServers.join(', ')}`, undefined, {
-        type: 'error',
-      });
+      log(
+        `Some servers failed to start: ${failedServers.join(', ')}`,
+        undefined,
+        {
+          type: 'error',
+        }
+      );
     }
+
+    if (runningServers.length === 0) {
+      throw new Error('No servers started successfully');
+    }
+
+    // Mark service as initialized since we have at least one working server
+    await service.initialize({ debug });
+    log(
+      `MCP service initialized with servers: ${runningServers.join(', ')}`,
+      undefined,
+      {
+        type: 'info',
+      }
+    );
   } catch (error) {
     log('Failed to initialize MCP', error, { type: 'error' });
+    await service.cleanup(); // Clean up on initialization failure
     throw error;
   }
 }
@@ -179,10 +195,10 @@ export async function getMcpTools(
     const service = MCPService.getInstance();
 
     if (!service.isInitialized()) {
-      log('MCP not initialized, initializing now...', undefined, {
-        debug: true,
-      });
-      await initializeMcp({ debug });
+      log('MCP service not initialized', undefined, { type: 'error' });
+      throw new Error(
+        'MCP service not initialized. Call initializeMcp() first.'
+      );
     }
 
     // Check if the specified server exists in configuration
@@ -251,7 +267,7 @@ export async function cleanupMcp(): Promise<void> {
 // Export configuration types and utilities
 export {
   ServerConfigSchema,
-  MCPConfigSchema,
+  MCPServersConfigSchema,
   loadMcpConfig,
   saveMcpConfig,
   validateServerConfig,

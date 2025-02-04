@@ -10,6 +10,9 @@ build/
 # Testing
 coverage/
 mcp.config.json
+client.md
+mcp-ai-sdk-bridge.md
+typesdk.md
 
 # Environment variables
 .env

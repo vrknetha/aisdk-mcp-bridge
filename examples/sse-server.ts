@@ -1,13 +1,26 @@
 import express from 'express';
 import cors from 'cors';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import { EventEmitter } from 'events';
-import { Request, Response } from 'express';
-import { Server as HttpServer } from 'http';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
+import {
+  ListToolsResultSchema,
+  CallToolResultSchema,
+} from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
+import { createServer } from 'net';
 
+// Server state
+const state = {
+  server: null as any,
+  isShuttingDown: false,
+  isInitialized: false,
+  startTime: Date.now(),
+  activeConnections: new Set<express.Response>(),
+};
+
+// Create Express app
 const app = express();
-// Configure CORS for SSE
 app.use(
   cors({
     origin: '*',
@@ -18,79 +31,64 @@ app.use(
 );
 app.use(express.json());
 
-// Server state management
-const state = {
-  port: parseInt(process.env.MCP_SERVER_PORT || '3005', 10),
-  server: null as HttpServer | null,
-  isShuttingDown: false,
-  isInitialized: false,
-  startTime: Date.now(),
-  healthCheckInterval: null as NodeJS.Timeout | null,
-  activeConnections: new Set<Response>(),
-  heartbeatInterval: null as NodeJS.Timeout | null,
+// Create MCP server with capabilities
+const mcpServer = new McpServer({
+  name: 'sse-server',
+  version: '1.0.0',
+  capabilities: {
+    tools: true,
+  },
+});
+
+// Register subscription tool
+const subscribeHandler = async (
+  {
+    topic,
+    options = {},
+  }: {
+    topic: string;
+    options?: { reconnectTimeout?: number; heartbeatInterval?: number };
+  },
+  extra: RequestHandlerExtra
+) => {
+  if (state.isShuttingDown) {
+    throw new Error('Server is shutting down');
+  }
+  return {
+    content: [{ type: 'text' as const, text: `Subscribed to ${topic}` }],
+  };
 };
 
-const emitter = new EventEmitter();
-emitter.setMaxListeners(100); // Increase max listeners
+// Initialize server state
+async function initializeServer() {
+  if (state.isInitialized) return;
 
-// Define the subscription tool
-const subscriptionTool = {
-  name: 'subscribeToUpdates',
-  description: 'Subscribe to real-time updates',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      topic: {
-        type: 'string',
-        description: 'Topic to subscribe to',
+  try {
+    // Register tools before accepting connections
+    mcpServer.tool(
+      'subscribe',
+      {
+        topic: z.string(),
+        options: z
+          .object({
+            reconnectTimeout: z.number().optional(),
+            heartbeatInterval: z.number().optional(),
+          })
+          .optional(),
       },
-    },
-    required: ['topic'],
-  },
-  handler: async (params: { topic: string }) => {
-    if (state.isShuttingDown) {
-      throw new Error('Server is shutting down');
-    }
-    if (!state.isInitialized) {
-      throw new Error('Server is still initializing');
-    }
+      subscribeHandler
+    );
 
-    emitter.emit('update', {
-      topic: params.topic,
-      timestamp: new Date().toISOString(),
-    });
-
-    return {
-      type: 'success',
-      value: {
-        content: [
-          {
-            type: 'text',
-            text: `Subscribed to ${params.topic}`,
-          },
-        ],
-      },
-    };
-  },
-} satisfies Tool;
-
-// Create MCP server
-const mcpServer = new Server(
-  {
-    name: 'sse-server',
-    version: '1.0.0',
-  },
-  {
-    capabilities: {
-      tools: {
-        subscribeToUpdates: subscriptionTool,
-      },
-    },
+    // Mark as initialized after tool registration
+    state.isInitialized = true;
+  } catch (error) {
+    console.error('Failed to initialize server:', error);
+    throw error;
   }
-);
+}
 
-// Health check endpoint with detailed status
-app.get('/health', (_: Request, res: Response) => {
+// Health check endpoint
+app.get('/health', (_req, res) => {
   const status = {
     status: state.isShuttingDown
       ? 'shutting_down'
@@ -98,245 +96,272 @@ app.get('/health', (_: Request, res: Response) => {
         ? 'ready'
         : 'starting',
     uptime: Date.now() - state.startTime,
-    port: state.port,
     connections: state.activeConnections.size,
+    mcp: {
+      serverName: 'sse-server',
+      toolCount: 1,
+    },
   };
 
-  if (state.isShuttingDown) {
-    res.status(503).json(status);
-  } else if (!state.isInitialized) {
-    res.status(503).json(status);
-  } else {
-    res.json(status);
+  res
+    .status(state.isInitialized && !state.isShuttingDown ? 200 : 503)
+    .json(status);
+});
+
+// SSE endpoint
+app.get('/sse', async (req, res) => {
+  if (!state.isInitialized || state.isShuttingDown) {
+    res.status(503).json({ error: 'Server not ready' });
+    return;
+  }
+
+  try {
+    // Set headers for SSE
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+
+    // Create SSE transport with proper endpoint
+    const transport = new SSEServerTransport('/messages', res);
+
+    // Connect transport to MCP server
+    await mcpServer.connect(transport);
+
+    // Track connection
+    state.activeConnections.add(res);
+
+    // Send initial connection message
+    const connectionId =
+      Date.now().toString(36) + Math.random().toString(36).substr(2);
+    const initialMessage = {
+      jsonrpc: '2.0',
+      method: 'notifications/connected',
+      params: {
+        id: connectionId,
+        status: 'ready',
+        server: {
+          name: 'sse-server',
+          version: '1.0.0',
+          capabilities: {
+            tools: true,
+          },
+        },
+      },
+    };
+    res.write(`data: ${JSON.stringify(initialMessage)}\n\n`);
+
+    // Setup heartbeat
+    const heartbeatInterval = setInterval(() => {
+      try {
+        if (!res.closed) {
+          const heartbeat = {
+            jsonrpc: '2.0',
+            method: 'notifications/heartbeat',
+            params: { timestamp: Date.now() },
+          };
+          res.write(`data: ${JSON.stringify(heartbeat)}\n\n`);
+        }
+      } catch (error) {
+        console.error('Heartbeat error:', error);
+        cleanup();
+      }
+    }, 30000);
+
+    // Cleanup function
+    const cleanup = () => {
+      clearInterval(heartbeatInterval);
+      state.activeConnections.delete(res);
+      if (!res.closed) {
+        res.end();
+      }
+    };
+
+    // Handle connection events
+    req.on('close', cleanup);
+    req.on('error', error => {
+      console.error('SSE connection error:', error);
+      cleanup();
+    });
+
+    transport.onclose = cleanup;
+    transport.onerror = error => {
+      console.error('Transport error:', error);
+      cleanup();
+    };
+  } catch (error) {
+    console.error('SSE endpoint error:', error);
+    if (!res.closed) {
+      res.status(500).end();
+    }
   }
 });
 
-// Tools endpoint with error handling
-app.get('/tools', async (_: Request, res: Response) => {
+// Message endpoint for SSE with improved error handling
+app.post('/messages', async (req, res) => {
   try {
-    if (!state.isInitialized) {
-      res.status(503).json({ error: 'Server is still initializing' });
-      return;
+    if (!state.isInitialized || state.isShuttingDown) {
+      throw new Error(
+        state.isShuttingDown
+          ? 'Server is shutting down'
+          : 'Server is initializing'
+      );
     }
-    if (state.isShuttingDown) {
-      res.status(503).json({ error: 'Server is shutting down' });
-      return;
+
+    // Create an abort controller with timeout
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), 30000);
+
+    const extra: RequestHandlerExtra = {
+      signal: abortController.signal,
+    };
+
+    try {
+      // Handle MCP requests
+      const { jsonrpc, id, method, params } = req.body;
+
+      if (jsonrpc !== '2.0') {
+        throw new Error('Invalid JSON-RPC version');
+      }
+
+      let result;
+      switch (method) {
+        case 'tools/list': {
+          result = {
+            tools: [
+              {
+                name: 'subscribe',
+                description: 'Subscribe to a topic',
+                inputSchema: {
+                  type: 'object',
+                  properties: {
+                    topic: { type: 'string' },
+                    options: {
+                      type: 'object',
+                      properties: {
+                        reconnectTimeout: { type: 'number' },
+                        heartbeatInterval: { type: 'number' },
+                      },
+                    },
+                  },
+                  required: ['topic'],
+                },
+              },
+            ],
+          };
+          break;
+        }
+        case 'tools/call': {
+          const { name, arguments: args } = params;
+          if (name === 'subscribe') {
+            result = await subscribeHandler(args, extra);
+          } else {
+            throw new Error(`Tool not found: ${name}`);
+          }
+          break;
+        }
+        default:
+          throw new Error(`Unknown method: ${method}`);
+      }
+
+      // Send JSON-RPC response
+      res.status(200).json({
+        jsonrpc: '2.0',
+        id,
+        result,
+      });
+    } finally {
+      clearTimeout(timeout);
     }
-    const tools = [subscriptionTool];
-    res.json(tools);
   } catch (error) {
-    console.error('Error retrieving tools:', error);
-    res.status(500).json({
-      error: error instanceof Error ? error.message : 'Unknown error occurred',
-      details: error instanceof Error ? error.stack : undefined,
+    const status =
+      error instanceof Error &&
+      (error.message.includes('initializing') ||
+        error.message.includes('shutting down'))
+        ? 503
+        : 500;
+
+    // Send JSON-RPC error response
+    res.status(status).json({
+      jsonrpc: '2.0',
+      id: req.body?.id,
+      error: {
+        code: status,
+        message:
+          error instanceof Error ? error.message : 'Unknown error occurred',
+      },
     });
   }
 });
 
-// Execute tool endpoint with improved error handling
-app.post('/execute', async (req: Request, res: Response) => {
-  try {
-    if (!state.isInitialized) {
-      res.status(503).json({ error: 'Server is still initializing' });
-      return;
-    }
-    if (state.isShuttingDown) {
-      res.status(503).json({ error: 'Server is shutting down' });
-      return;
-    }
-
-    const { toolName, params } = req.body;
-    const tool =
-      toolName === 'subscribeToUpdates' ? subscriptionTool : undefined;
-
-    if (!tool) {
-      res.status(404).json({ error: `Tool ${toolName} not found` });
-      return;
-    }
-
-    const result = await tool.handler(params);
-    res.json(result);
-  } catch (error) {
-    console.error('Error executing tool:', error);
-    res
-      .status(
-        error instanceof Error && error.message.includes('validation')
-          ? 400
-          : 500
-      )
-      .json({
-        error:
-          error instanceof Error ? error.message : 'Unknown error occurred',
-        details: error instanceof Error ? error.stack : undefined,
-      });
-  }
-});
-
-// SSE endpoint with improved connection handling
-app.get('/events', (req: Request, res: Response) => {
-  if (!state.isInitialized) {
-    res.status(503).json({ error: 'Server is still initializing' });
-    return;
-  }
-  if (state.isShuttingDown) {
-    res.status(503).end();
-    return;
-  }
-
-  // Set headers for SSE
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Credentials': 'true',
+// Helper function to check if port is available
+async function isPortAvailable(port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const tester = createServer()
+      .once('error', () => {
+        resolve(false);
+      })
+      .once('listening', () => {
+        tester
+          .once('close', () => {
+            resolve(true);
+          })
+          .close();
+      })
+      .listen(port);
   });
-
-  // Track connection
-  state.activeConnections.add(res);
-
-  // Send initial connection message
-  res.write('data: {"type": "connected"}\n\n');
-
-  // Setup heartbeat for this connection
-  const heartbeatInterval = setInterval(() => {
-    if (!res.closed) {
-      res.write(':\n\n'); // Empty comment to keep connection alive
-    }
-  }, 30000);
-
-  // Handle updates
-  const listener = (data: unknown) => {
-    if (!res.closed) {
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    }
-  };
-
-  emitter.on('update', listener);
-
-  // Clean up on client disconnect
-  req.on('close', () => {
-    clearInterval(heartbeatInterval);
-    state.activeConnections.delete(res);
-    emitter.off('update', listener);
-  });
-
-  // Handle errors
-  req.on('error', error => {
-    console.error('SSE connection error:', error);
-    clearInterval(heartbeatInterval);
-    state.activeConnections.delete(res);
-    emitter.off('update', listener);
-  });
-});
-
-// Improved port finding with timeout and retries
-async function findAvailablePort(
-  startPort: number,
-  maxRetries = 10
-): Promise<number> {
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      const port = startPort + attempt;
-      await new Promise<void>((resolve, reject) => {
-        const testServer = app.listen(port);
-        const timeout = setTimeout(() => {
-          testServer.close();
-          reject(new Error('Port check timeout'));
-        }, 3000);
-
-        testServer.once('listening', () => {
-          clearTimeout(timeout);
-          testServer.close(() => resolve());
-        });
-
-        testServer.once('error', (err: NodeJS.ErrnoException) => {
-          clearTimeout(timeout);
-          if (err.code === 'EADDRINUSE') {
-            resolve(); // Continue to next port
-          } else {
-            reject(err);
-          }
-        });
-      });
-
-      console.log(`Found available port: ${port}`);
-      return port;
-    } catch (error) {
-      if (attempt === maxRetries - 1) {
-        throw new Error(
-          `No available ports found after ${maxRetries} attempts`
-        );
-      }
-    }
-  }
-  throw new Error('Port finding failed');
 }
 
-// Start server with initialization checks
+// Helper function to find next available port
+async function findAvailablePort(startPort: number): Promise<number> {
+  let port = startPort;
+  while (!(await isPortAvailable(port))) {
+    port++;
+    if (port - startPort > 100) {
+      throw new Error('No available ports found in range');
+    }
+  }
+  return port;
+}
+
+// Export server functions for MCP integration
 export async function startServer(): Promise<void> {
   if (state.server) {
     throw new Error('Server is already running');
   }
 
+  const requestedPort = parseInt(process.env.MCP_SERVER_PORT || '3003', 10);
+
   try {
-    // Find available port
-    state.port = await findAvailablePort(state.port);
-    console.log(`Starting SSE server on port ${state.port}...`);
+    // Check if requested port is available
+    const port = await findAvailablePort(requestedPort);
+    if (port !== requestedPort) {
+      console.log(
+        `Port ${requestedPort} is in use, using port ${port} instead`
+      );
+    }
+
+    // Initialize MCP server before starting HTTP server
+    await initializeServer();
 
     return new Promise((resolve, reject) => {
-      const startTimeout = setTimeout(() => {
-        reject(new Error('Server startup timeout'));
-      }, 10000);
-
-      state.server = app.listen(state.port, async () => {
-        try {
-          // Update environment variable with actual port
-          process.env.MCP_SERVER_PORT = state.port.toString();
-
-          // Initialize health check
-          state.healthCheckInterval = setInterval(() => {
-            if (state.server && !state.isShuttingDown) {
-              state.server.getConnections((err, count) => {
-                if (err) {
-                  console.error('Health check error:', err);
-                } else {
-                  console.debug(`Active connections: ${count}`);
-                }
-              });
-            }
-          }, 30000);
-
-          // Initialize heartbeat for all connections
-          state.heartbeatInterval = setInterval(() => {
-            state.activeConnections.forEach(connection => {
-              if (!connection.closed) {
-                connection.write(':\n\n'); // Empty comment to keep connection alive
-              } else {
-                state.activeConnections.delete(connection);
-              }
-            });
-          }, 30000);
-
-          // Wait for initialization
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          state.isInitialized = true;
-
-          console.log(`SSE server ready on port ${state.port}`);
-          clearTimeout(startTimeout);
+      try {
+        state.server = app.listen(port, () => {
+          console.log(`SSE server ready on port ${port}`);
+          // Update environment variable with actual port used
+          process.env.MCP_SERVER_PORT = port.toString();
           resolve();
-        } catch (error) {
-          clearTimeout(startTimeout);
-          console.error('Failed to initialize server:', error);
-          reject(error);
-        }
-      });
+        });
 
-      state.server.on('error', (error: NodeJS.ErrnoException) => {
-        clearTimeout(startTimeout);
-        console.error('Server error:', error);
+        state.server.on('error', (error: Error) => {
+          console.error('Server error:', error);
+          reject(error);
+        });
+      } catch (error) {
         reject(error);
-      });
+      }
     });
   } catch (error) {
     console.error('Failed to start server:', error);
@@ -344,78 +369,59 @@ export async function startServer(): Promise<void> {
   }
 }
 
-// Improved shutdown with cleanup
 export async function stopServer(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (!state.server) {
-      resolve();
-      return;
-    }
+  if (!state.server) return;
 
-    state.isShuttingDown = true;
+  state.isShuttingDown = true;
+  console.log('Shutting down SSE server...');
 
-    // Clear intervals
-    if (state.healthCheckInterval) {
-      clearInterval(state.healthCheckInterval);
-      state.healthCheckInterval = null;
-    }
-    if (state.heartbeatInterval) {
-      clearInterval(state.heartbeatInterval);
-      state.heartbeatInterval = null;
-    }
+  // Close all active connections
+  for (const connection of state.activeConnections) {
+    connection.end();
+  }
+  state.activeConnections.clear();
 
-    // Close all active connections
-    state.activeConnections.forEach(connection => {
-      try {
-        connection.end();
-      } catch (error) {
-        console.error('Error closing SSE connection:', error);
+  return new Promise<void>((resolve, reject) => {
+    const closeTimeout = setTimeout(() => {
+      console.warn('Server close timed out, forcing shutdown');
+      if (state.server) {
+        state.server.unref(); // Allow the process to exit even if connections are pending
       }
-    });
-    state.activeConnections.clear();
+      resolve();
+    }, 5000); // 5 second timeout
 
-    // Give existing requests time to complete
-    const shutdownTimeout = setTimeout(() => {
-      console.log('Force closing remaining connections...');
-      state.server?.close();
-    }, 5000);
-
-    state.server.close(error => {
-      clearTimeout(shutdownTimeout);
+    state.server.close(async (error?: Error) => {
+      clearTimeout(closeTimeout);
       if (error) {
         console.error('Error closing server:', error);
         reject(error);
-      } else {
-        console.log('Server closed successfully');
-        state.server = null;
-        state.isShuttingDown = false;
+        return;
+      }
+
+      try {
+        await mcpServer.close();
         state.isInitialized = false;
+        state.server = null;
+        console.log('SSE server shutdown complete');
         resolve();
+      } catch (closeError) {
+        reject(closeError);
       }
     });
   });
 }
 
-// Export MCP server
-export { mcpServer };
-
-// Graceful shutdown handlers
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
-  await stopServer();
-  process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-  console.log('SIGINT received. Shutting down gracefully...');
-  await stopServer();
-  process.exit(0);
-});
-
-// Start server
+// Start server if running directly
 if (require.main === module) {
   startServer().catch(error => {
-    console.error('Failed to start SSE server:', error);
+    console.error('Failed to start server:', error);
     process.exit(1);
   });
+
+  // Handle process signals
+  process.on('SIGTERM', () => void stopServer());
+  process.on('SIGINT', () => void stopServer());
 }
+
+// Export for testing
+export { mcpServer };

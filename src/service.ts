@@ -196,7 +196,7 @@ export class MCPService {
             toolsTimeout,
           ])) as z.infer<typeof ListToolsResultSchema>;
 
-          // Store tools in the map
+          // Store tools in the map with proper AI SDK format
           const toolSet: ToolSet = {};
           for (const tool of response.tools) {
             toolSet[tool.name] = {
@@ -205,7 +205,12 @@ export class MCPService {
                 ? jsonSchemaToZod(tool.inputSchema as JSONSchema7)
                 : createDefaultSchema(),
               execute: async (args: unknown) => {
-                return client.request(
+                log(
+                  `Executing tool ${tool.name}`,
+                  { arguments: args },
+                  { debug: true }
+                );
+                const result = await client.request(
                   {
                     method: 'tools/call',
                     params: {
@@ -215,6 +220,15 @@ export class MCPService {
                   },
                   CallToolResultSchema
                 );
+                log(`Tool ${tool.name} response:`, result, { debug: true });
+                return {
+                  type: 'function',
+                  function: {
+                    name: tool.name,
+                    arguments: JSON.stringify(args),
+                  },
+                  content: result.content,
+                };
               },
             };
           }
@@ -389,6 +403,11 @@ export class MCPService {
     }
 
     try {
+      log(
+        `Executing function ${functionName} on server ${serverName}`,
+        { arguments: args },
+        { debug: true }
+      );
       const response = await client.request(
         {
           method: 'tools/call',
@@ -399,7 +418,7 @@ export class MCPService {
         },
         CallToolResultSchema
       );
-
+      log(`Function ${functionName} response:`, response, { debug: true });
       return response as MCPToolResult;
     } catch (error) {
       log(`Failed to execute function ${functionName}`, error, {
