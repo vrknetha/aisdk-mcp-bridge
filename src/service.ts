@@ -3,7 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { log, jsonSchemaToZod, createDefaultSchema } from './tools';
 import { toStdioParams } from './index';
-import { MCPServerManager, ServerConfig } from './server';
+import { MCPServerManager, ServerConfig, MCPServersConfig } from './server';
 import {
   CallToolResultSchema,
   ListToolsResultSchema,
@@ -11,6 +11,7 @@ import {
 import type { JSONSchema7 } from 'json-schema';
 import fs from 'fs';
 import path from 'path';
+import * as z from 'zod';
 
 export interface MCPToolResult {
   content: Array<{
@@ -22,14 +23,22 @@ export interface MCPToolResult {
 
 export class MCPService {
   private static instance: MCPService;
-  private serverManager: MCPServerManager;
-  private clients: Map<string, Client> = new Map();
-  private transports: Map<string, StdioClientTransport> = new Map();
-  private tools: Map<string, ToolSet> = new Map();
-  private initialized = false;
+  private clients: Map<string, Client>;
+  private transports: Map<string, StdioClientTransport>;
+  private tools: Map<string, ToolSet>;
+  private initialized: boolean;
+  private serverManager: MCPServerManager | null;
 
   private constructor() {
-    this.serverManager = MCPServerManager.getInstance();
+    this.clients = new Map();
+    this.transports = new Map();
+    this.tools = new Map();
+    this.initialized = false;
+    this.serverManager = null;
+
+    // Handle process signals for graceful shutdown
+    process.on('SIGTERM', this.handleShutdown.bind(this));
+    process.on('SIGINT', this.handleShutdown.bind(this));
   }
 
   public static getInstance(): MCPService {
@@ -43,6 +52,17 @@ export class MCPService {
     return this.initialized;
   }
 
+  public getConfig(): MCPServersConfig {
+    if (!this.serverManager) {
+      throw new Error('Server manager not initialized');
+    }
+    return this.serverManager.getConfig();
+  }
+
+  public setServerManager(serverManager: MCPServerManager): void {
+    this.serverManager = serverManager;
+  }
+
   private async initializeServer(
     serverName: string,
     serverConfig: ServerConfig,
@@ -51,118 +71,202 @@ export class MCPService {
     const { debug = false } = options;
     log(`Initializing server ${serverName}`, undefined, { debug });
 
-    // Start the server first
-    const started = await this.serverManager.startServer(serverName);
-    if (!started) {
-      throw new Error(`Failed to start server ${serverName}`);
-    }
-    log(`Server ${serverName} started successfully`, undefined, { debug });
-
-    // Create client if not exists
-    if (!this.clients.has(serverName)) {
-      log(`Creating new client for ${serverName}`, undefined, { debug });
-      const client = new Client({
-        name: 'linkedin-agent',
-        version: '1.0.0',
+    try {
+      // Start the server with timeout
+      const startTimeout = new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(
+            new Error(`Server ${serverName} start timeout after 30 seconds`)
+          );
+        }, 30000);
       });
 
-      // Convert config to StdioServerParameters
-      const stdioParams = toStdioParams(serverConfig);
-      const transport = new StdioClientTransport(stdioParams);
+      // Start server with timeout race
+      const started = await Promise.race([
+        this.serverManager!.startServer(serverName),
+        startTimeout,
+      ]);
 
-      transport.onerror = (error: Error) => {
-        // Only log actual errors, ignore ENOENT for npx as it's expected
-        if (error.message.includes('spawn npx ENOENT')) {
-          log('Ignoring expected npx ENOENT error', undefined, { debug });
-          return;
-        }
-        log(`Transport error for ${serverName}`, error, {
-          type: 'error',
-          debug,
-        });
-      };
-
-      await client.connect(transport);
-      this.clients.set(serverName, client);
-      this.transports.set(serverName, transport);
-      log(`Client created and connected for ${serverName}`, undefined, {
-        debug,
-      });
-    }
-
-    // Get tools for this server
-    const client = this.clients.get(serverName)!;
-    log(`Requesting tools from ${serverName}...`, undefined, { debug });
-    const response = await client.request(
-      { method: 'tools/list' },
-      ListToolsResultSchema
-    );
-    log(`Received tools response from ${serverName}:`, response, { debug });
-
-    // Convert response tools to ToolSet
-    const toolSet: ToolSet = {};
-    for (const tool of response.tools) {
-      // Only log tool conversion if explicitly debugging
-      if (debug) {
-        log(`Converting tool ${tool.name}`, tool, { debug });
+      if (!started) {
+        throw new Error(`Failed to start server ${serverName}`);
       }
 
-      const zodSchema = tool.inputSchema
-        ? jsonSchemaToZod(tool.inputSchema as JSONSchema7, debug)
-        : createDefaultSchema();
+      log(`Server ${serverName} started successfully`, undefined, { debug });
 
-      toolSet[tool.name] = {
-        description: tool.description || '',
-        parameters: zodSchema,
-        execute: async (args: unknown) => {
-          // Only log execution if explicitly debugging
-          if (debug) {
-            log(`Executing tool ${tool.name}`, args, { debug });
+      // Create client if not exists with timeout
+      if (!this.clients.has(serverName)) {
+        log(`Creating new client for ${serverName}`, undefined, { debug });
+        const client = new Client({
+          name: 'mcp-bridge',
+          version: '1.0.0',
+        });
+
+        // Convert config to StdioServerParameters
+        const stdioParams = toStdioParams(serverConfig);
+
+        // For stdio servers, we need to handle stderr differently
+        if (serverConfig.mode === 'stdio') {
+          stdioParams.stderr = 'pipe';
+        }
+
+        const transport = new StdioClientTransport(stdioParams);
+
+        // Set up error handling
+        transport.onerror = (error: Error) => {
+          // Only log actual errors, ignore ENOENT for npx as it's expected
+          if (error.message.includes('spawn npx ENOENT')) {
+            log('Ignoring expected npx ENOENT error', undefined, { debug });
+            return;
           }
+          log(`Transport error for ${serverName}`, error, {
+            type: 'error',
+            debug,
+          });
+        };
+
+        // Connect with timeout and retry
+        const maxRetries = 3;
+        let retryCount = 0;
+        let lastError: Error | null = null;
+
+        while (retryCount < maxRetries) {
           try {
-            const result = await client.request(
-              {
-                method: 'tools/call',
-                params: {
-                  name: tool.name,
-                  arguments: args,
-                },
-              },
-              CallToolResultSchema
-            );
-            // Only log result if explicitly debugging
-            if (debug) {
-              log(`Tool ${tool.name} execution result`, result, { debug });
-            }
-            return result;
-          } catch (error) {
-            log(`Tool ${tool.name} execution failed`, error, {
-              type: 'error',
+            const connectTimeout = new Promise<void>((_, reject) => {
+              setTimeout(() => {
+                reject(
+                  new Error(
+                    `Client connection timeout for ${serverName} after 15 seconds`
+                  )
+                );
+              }, 15000);
             });
-            throw error;
-          }
-        },
-      };
-    }
 
-    this.tools.set(serverName, toolSet);
-    // Only log tools initialization if explicitly debugging
-    if (debug) {
-      log(`Server ${serverName} initialized with tools`, toolSet, { debug });
+            await Promise.race([client.connect(transport), connectTimeout]);
+
+            // Connection successful
+            this.clients.set(serverName, client);
+            this.transports.set(serverName, transport);
+            log(`Client created and connected for ${serverName}`, undefined, {
+              debug,
+            });
+            break;
+          } catch (error) {
+            lastError = error as Error;
+            retryCount++;
+            if (retryCount < maxRetries) {
+              log(
+                `Retrying connection for ${serverName} (attempt ${retryCount + 1}/${maxRetries})`,
+                undefined,
+                { debug }
+              );
+              await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s between retries
+            }
+          }
+        }
+
+        if (retryCount === maxRetries) {
+          throw new Error(
+            `Failed to connect to ${serverName} after ${maxRetries} attempts: ${lastError?.message}`
+          );
+        }
+      }
+
+      // Get tools with timeout and retry
+      const client = this.clients.get(serverName)!;
+      log(`Requesting tools from ${serverName}...`, undefined, { debug });
+
+      const maxToolRetries = 3;
+      let toolRetryCount = 0;
+      let lastToolError: Error | null = null;
+
+      while (toolRetryCount < maxToolRetries) {
+        try {
+          const toolsTimeout = new Promise((_, reject) => {
+            setTimeout(() => {
+              reject(
+                new Error(
+                  `Tools request timeout for ${serverName} after 10 seconds`
+                )
+              );
+            }, 10000);
+          });
+
+          const response = (await Promise.race([
+            client.request({ method: 'tools/list' }, ListToolsResultSchema),
+            toolsTimeout,
+          ])) as z.infer<typeof ListToolsResultSchema>;
+
+          // Store tools in the map
+          const toolSet: ToolSet = {};
+          for (const tool of response.tools) {
+            toolSet[tool.name] = {
+              description: tool.description || '',
+              parameters: tool.inputSchema
+                ? jsonSchemaToZod(tool.inputSchema as JSONSchema7)
+                : createDefaultSchema(),
+              execute: async (args: unknown) => {
+                return client.request(
+                  {
+                    method: 'tools/call',
+                    params: {
+                      name: tool.name,
+                      arguments: args,
+                    },
+                  },
+                  CallToolResultSchema
+                );
+              },
+            };
+          }
+          this.tools.set(serverName, toolSet);
+
+          log(`Received and processed tools from ${serverName}:`, response, {
+            debug,
+          });
+          break;
+        } catch (error) {
+          lastToolError = error as Error;
+          toolRetryCount++;
+          if (toolRetryCount < maxToolRetries) {
+            log(
+              `Retrying tools request for ${serverName} (attempt ${toolRetryCount + 1}/${maxToolRetries})`,
+              undefined,
+              { debug }
+            );
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s between retries
+          }
+        }
+      }
+
+      if (toolRetryCount === maxToolRetries) {
+        throw new Error(
+          `Failed to get tools from ${serverName} after ${maxToolRetries} attempts: ${lastToolError?.message}`
+        );
+      }
+    } catch (error) {
+      // Clean up resources on initialization failure
+      await this.cleanup();
+      throw error;
     }
   }
 
   public async initialize(options: { debug?: boolean } = {}): Promise<void> {
     if (this.initialized) {
+      log('MCP service already initialized', undefined, {
+        debug: options.debug,
+      });
       return;
     }
 
     const { debug = false } = options;
-    const config = this.serverManager.getConfig();
+    const config = this.serverManager!.getConfig();
 
     if (!config) {
       throw new Error('No MCP server configuration found');
     }
+
+    const initializationErrors: Record<string, Error> = {};
+    let anyServerInitialized = false;
 
     for (const [serverName, serverConfig] of Object.entries(
       config.mcpServers
@@ -174,18 +278,34 @@ export class MCPService {
 
       try {
         await this.initializeServer(serverName, serverConfig, { debug });
+        anyServerInitialized = true;
       } catch (error) {
         log(`Failed to initialize server ${serverName}`, error, {
           type: 'error',
         });
+        initializationErrors[serverName] = error as Error;
       }
     }
 
+    // If all servers failed to initialize, throw error
+    if (!anyServerInitialized) {
+      const errorMessage = Object.entries(initializationErrors)
+        .map(([name, error]) => `${name}: ${error.message}`)
+        .join('\n');
+      throw new Error(`All servers failed to initialize:\n${errorMessage}`);
+    }
+
     this.initialized = true;
+    log('MCP service initialization complete', undefined, { debug });
   }
 
   public async cleanup(): Promise<void> {
     log('Cleaning up MCP service', undefined, { type: 'info' });
+
+    // First stop all servers
+    if (this.serverManager) {
+      await this.serverManager.stopAllServers();
+    }
 
     // Clean up all clients and transports
     for (const [serverName, client] of this.clients.entries()) {
@@ -206,23 +326,23 @@ export class MCPService {
   }
 
   public async getTools(
-    options: {
-      debug?: boolean;
-      serverName?: string;
-    } = {}
+    options: { debug?: boolean; serverName?: string } = {}
   ): Promise<ToolSet> {
+    const { debug = false, serverName } = options;
+
     if (!this.initialized) {
-      throw new Error('MCP service not initialized. Call initialize() first.');
+      log('MCP service not initialized, initializing now...', undefined, {
+        debug,
+      });
+      await this.initialize({ debug });
     }
 
-    const { debug = false, serverName } = options;
     const allTools: ToolSet = {};
-    const rawTools: Record<string, unknown> = {};
     const runningServers = serverName
       ? [serverName]
-      : this.serverManager.getRunningServers();
+      : this.serverManager!.getRunningServers();
 
-    if (serverName && !this.serverManager.isServerRunning(serverName)) {
+    if (serverName && !this.serverManager!.isServerRunning(serverName)) {
       throw new Error(`Server ${serverName} is not running`);
     }
 
@@ -234,66 +354,26 @@ export class MCPService {
 
     for (const serverName of runningServers) {
       try {
-        const serverInfo = this.serverManager.getServerInfo(serverName);
-        log(
-          `Processing server ${serverName}, mode: ${serverInfo?.mode}`,
-          undefined,
-          { debug }
-        );
-
-        if (serverInfo?.mode === 'stdio') {
-          // Get raw MCP tools
-          const client = this.clients.get(serverName);
-          if (client) {
-            log(`Requesting tools from server ${serverName}...`, undefined, {
-              debug,
-            });
-            const response = await client.request(
-              { method: 'tools/list' },
-              ListToolsResultSchema
-            );
-            log(`Received tools response from ${serverName}:`, response, {
-              debug,
-            });
-            rawTools[serverName] = response.tools;
-          } else {
-            log(`No client found for server ${serverName}`, undefined, {
-              type: 'error',
-              debug,
-            });
-          }
-
-          // Get converted tools
-          const tools = this.tools.get(serverName) || {};
-          log(`Retrieved converted tools for ${serverName}:`, tools, { debug });
-          Object.assign(allTools, tools);
+        const tools = this.tools.get(serverName);
+        if (!tools) {
+          log(
+            `No tools found for server ${serverName}, requesting...`,
+            undefined,
+            { debug }
+          );
+          await this.initializeServer(
+            serverName,
+            this.serverManager!.getServerInfo(serverName)!,
+            { debug }
+          );
         }
+        Object.assign(allTools, this.tools.get(serverName) || {});
       } catch (error) {
         log(`Failed to get tools for server ${serverName}`, error, {
           type: 'error',
-          debug,
         });
       }
     }
-
-    // Create logs directory if it doesn't exist
-    const logsDir = path.join(process.cwd(), 'logs');
-    if (!fs.existsSync(logsDir)) {
-      fs.mkdirSync(logsDir, { recursive: true });
-    }
-
-    log(`Final raw tools:`, rawTools, { debug });
-    log(`Final converted tools:`, allTools, { debug });
-
-    // Save raw MCP tools
-    const rawToolsPath = path.join(logsDir, 'mcp-tools.json');
-    fs.writeFileSync(rawToolsPath, JSON.stringify(rawTools, null, 2));
-    log(`Saved raw MCP tools to ${rawToolsPath}`, undefined, { debug });
-
-    // Save converted AI SDK tools
-    const aiToolsPath = path.join(logsDir, 'ai-sdk-tools.json');
-    fs.writeFileSync(aiToolsPath, JSON.stringify(allTools, null, 2));
-    log(`Saved converted AI SDK tools to ${aiToolsPath}`, undefined, { debug });
 
     return allTools;
   }
@@ -326,6 +406,19 @@ export class MCPService {
         type: 'error',
       });
       throw error;
+    }
+  }
+
+  private async handleShutdown(signal: string): Promise<void> {
+    log(`${signal} received. Shutting down gracefully...`, undefined, {
+      type: 'info',
+    });
+    try {
+      await this.cleanup();
+      process.exit(0);
+    } catch (error) {
+      log('Error during shutdown:', error, { type: 'error' });
+      process.exit(1);
     }
   }
 }

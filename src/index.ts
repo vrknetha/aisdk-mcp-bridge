@@ -116,7 +116,7 @@ function validateServerConfig(config: ServerConfig): string[] {
 }
 
 /**
- * Initialize MCP service with configuration
+ * Initialize MCP service
  */
 export async function initializeMcp(
   options: {
@@ -125,55 +125,44 @@ export async function initializeMcp(
   } = {}
 ): Promise<void> {
   const { debug = false } = options;
+  log('Initializing MCP...', undefined, { debug: true });
 
   try {
-    log('Starting MCP initialization...', undefined, { debug: true });
-
     // Load configuration
     const configPath =
       options.configPath || path.join(process.cwd(), 'mcp.config.json');
-    log(
-      'Loading config from default location',
-      { path: configPath },
-      { type: 'info' }
-    );
+    const config = await loadMcpConfig(configPath);
+    log('Loaded MCP configuration', config, { debug });
 
-    let config: MCPServersConfig;
-    try {
-      config = await loadMcpConfig(configPath);
-      log('Loaded MCP configuration', config, { debug: true });
-    } catch (error) {
-      log(
-        'No MCP configuration found. Please provide a valid mcp.config.json',
-        error,
-        { type: 'error' }
-      );
-      throw new Error(
-        'MCP configuration is required. Please provide a valid mcp.config.json'
-      );
-    }
+    // Initialize server manager with config
+    const serverManager = MCPServerManager.getInstance(config);
 
-    // Initialize server manager
-    const serverManager = MCPServerManager.getInstance();
-    serverManager.setConfig(config);
-    log('Server manager configured', undefined, { debug: true });
-
-    // Initialize MCP service
+    // Initialize MCP service with server manager
     const service = MCPService.getInstance();
-    await service.initialize({ debug });
-    log('MCP initialization complete', undefined, { type: 'info' });
+    service.setServerManager(serverManager);
+
+    // Start all servers
+    const results = await serverManager.startAllServers();
+    log('Server startup results:', results, { debug: true });
+
+    // Check if any servers failed to start
+    const failedServers = Array.from(results.entries())
+      .filter(([_, success]) => !success)
+      .map(([name]) => name);
+
+    if (failedServers.length > 0) {
+      log(`Failed to start servers: ${failedServers.join(', ')}`, undefined, {
+        type: 'error',
+      });
+    }
   } catch (error) {
-    log('MCP initialization failed', error, { type: 'error' });
+    log('Failed to initialize MCP', error, { type: 'error' });
     throw error;
   }
 }
 
 /**
  * Get tools from MCP servers
- * @param options Configuration options
- * @param options.debug Enable debug logging
- * @param options.serverName Optional server name to get tools from a specific server
- * @returns Promise<ToolSet>
  */
 export async function getMcpTools(
   options: {
@@ -198,7 +187,7 @@ export async function getMcpTools(
 
     // Check if the specified server exists in configuration
     if (serverName) {
-      const serverManager = MCPServerManager.getInstance();
+      const serverManager = MCPServerManager.getInstance(service.getConfig());
       const config = serverManager.getConfig();
       if (!config?.mcpServers[serverName]) {
         const error = new Error(
@@ -245,12 +234,18 @@ export async function executeMcpFunction(
 }
 
 /**
- * Clean up all MCP resources.
- * Should be called when shutting down the application.
+ * Clean up MCP resources
  */
 export async function cleanupMcp(): Promise<void> {
-  const service = MCPService.getInstance();
-  await service.cleanup();
+  try {
+    log('Cleaning up MCP resources...', undefined, { debug: true });
+    const service = MCPService.getInstance();
+    await service.cleanup();
+    log('MCP cleanup complete', undefined, { debug: true });
+  } catch (error) {
+    log('Failed to clean up MCP resources', error, { type: 'error' });
+    throw error;
+  }
 }
 
 // Export configuration types and utilities

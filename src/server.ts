@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { spawn, ChildProcess } from 'child_process';
 import axios from 'axios';
+import { log } from './tools';
+import net from 'net';
 
 // Custom EventSource type that supports headers
 interface CustomEventSourceInit extends EventSourceInit {
@@ -34,24 +36,25 @@ export const MCPServersConfigSchema = z.object({
 
 export type MCPServersConfig = z.infer<typeof MCPServersConfigSchema>;
 
-interface RunningServer {
-  process: ChildProcess | null; // null for SSE servers
-  port: number;
-  mode: 'http' | 'stdio' | 'sse';
-  sseClient?: EventSource;
+interface RunningServer extends ServerConfig {
+  startTime: number;
+  process?: ChildProcess;
 }
 
 export class MCPServerManager {
   private static instance: MCPServerManager;
-  private servers: Map<string, RunningServer> = new Map();
-  private config: MCPServersConfig | null = null;
+  private config: MCPServersConfig;
+  private runningServers: Map<string, RunningServer> = new Map();
   private nextPort: number = 3000;
+  private startupPromises: Map<string, Promise<boolean>> = new Map();
 
-  private constructor() {}
+  private constructor(config: MCPServersConfig) {
+    this.config = config;
+  }
 
-  public static getInstance(): MCPServerManager {
+  public static getInstance(config: MCPServersConfig): MCPServerManager {
     if (!MCPServerManager.instance) {
-      MCPServerManager.instance = new MCPServerManager();
+      MCPServerManager.instance = new MCPServerManager(config);
     }
     return MCPServerManager.instance;
   }
@@ -65,7 +68,7 @@ export class MCPServerManager {
       this.config = validatedConfig;
 
       // Reset server state when config changes
-      this.servers.clear();
+      this.runningServers.clear();
       this.nextPort = 3000;
 
       return true;
@@ -75,12 +78,12 @@ export class MCPServerManager {
     }
   }
 
-  public getConfig(): MCPServersConfig | null {
+  public getConfig(): MCPServersConfig {
     return this.config;
   }
 
-  public getServerInfo(serverName: string): RunningServer | null {
-    return this.servers.get(serverName) || null;
+  public getServerInfo(serverName: string): ServerConfig | undefined {
+    return this.config.mcpServers[serverName];
   }
 
   private getNextPort(): number {
@@ -113,7 +116,9 @@ export class MCPServerManager {
     serverConfig: ServerConfig
   ): Promise<boolean> {
     try {
-      console.log(`Starting ${serverName} in stdio mode...`);
+      log(`Starting ${serverName} in stdio mode...`, undefined, {
+        type: 'info',
+      });
       const server = spawn(serverConfig.command, serverConfig.args, {
         env: {
           ...process.env,
@@ -125,42 +130,56 @@ export class MCPServerManager {
       let serverOutput = '';
       server.stdout.on('data', data => {
         serverOutput += data.toString();
-        console.log(`[${serverName}] ${data.toString()}`);
+        log(`[${serverName}] ${data.toString()}`, undefined, { type: 'info' });
       });
 
       server.stderr.on('data', data => {
         serverOutput += data.toString();
-        console.error(`[${serverName}] Error: ${data.toString()}`);
+        log(`[${serverName}] Error: ${data.toString()}`, undefined, {
+          type: 'error',
+        });
       });
 
       server.on('close', code => {
-        console.log(`[${serverName}] Server exited with code ${code}`);
-        this.servers.delete(serverName);
+        log(`[${serverName}] Server exited with code ${code}`, undefined, {
+          type: 'info',
+        });
+        this.runningServers.delete(serverName);
       });
 
       // Store server reference
-      this.servers.set(serverName, {
+      this.runningServers.set(serverName, {
+        ...serverConfig,
         process: server,
         port: -1, // No port for stdio mode
         mode: 'stdio',
+        startTime: Date.now(),
       });
-      console.log(`[${serverName}] Server registered in stdio mode`);
+      log(`[${serverName}] Server registered in stdio mode`, undefined, {
+        type: 'info',
+      });
 
       // Wait a bit for the server to initialize
       await new Promise(resolve => setTimeout(resolve, 2000));
 
       // Verify server is still registered
-      if (!this.servers.has(serverName)) {
-        console.error(
-          `[${serverName}] Server registration lost during initialization`
+      if (!this.runningServers.has(serverName)) {
+        log(
+          `[${serverName}] Server registration lost during initialization`,
+          undefined,
+          { type: 'error' }
         );
         return false;
       }
 
-      console.log(`[${serverName}] Server initialization complete`);
+      log(`[${serverName}] Server initialization complete`, undefined, {
+        type: 'info',
+      });
       return true;
     } catch (error) {
-      console.error(`Failed to start stdio server ${serverName}:`, error);
+      log(`Failed to start stdio server ${serverName}`, error, {
+        type: 'error',
+      });
       return false;
     }
   }
@@ -170,8 +189,35 @@ export class MCPServerManager {
     serverConfig: ServerConfig
   ): Promise<boolean> {
     try {
-      const port = serverConfig.port || this.getNextPort();
-      console.log(`Starting ${serverName} in HTTP mode on port ${port}...`);
+      // Use configured port or find next available
+      const port = serverConfig.port || 3004;
+      log(`Starting ${serverName} in HTTP mode on port ${port}...`, undefined, {
+        type: 'info',
+      });
+
+      // Check if port is available before starting
+      try {
+        const testServer = net.createServer();
+        await new Promise<void>((resolve, reject) => {
+          testServer.once('error', (err: NodeJS.ErrnoException) => {
+            if (err.code === 'EADDRINUSE') {
+              reject(new Error(`Port ${port} is already in use`));
+            } else {
+              reject(err);
+            }
+          });
+          testServer.once('listening', () => {
+            testServer.close();
+            resolve();
+          });
+          testServer.listen(port);
+        });
+      } catch (error) {
+        log(`Port ${port} is not available for ${serverName}`, error, {
+          type: 'error',
+        });
+        return false;
+      }
 
       const server = spawn(serverConfig.command, serverConfig.args, {
         env: {
@@ -186,182 +232,368 @@ export class MCPServerManager {
       let serverOutput = '';
       server.stdout.on('data', data => {
         serverOutput += data.toString();
-        console.log(`[${serverName}] ${data.toString()}`);
+        log(`[${serverName}] ${data.toString()}`, undefined, { type: 'info' });
       });
 
       server.stderr.on('data', data => {
         serverOutput += data.toString();
-        console.error(`[${serverName}] Error: ${data.toString()}`);
+        log(`[${serverName}] Error: ${data.toString()}`, undefined, {
+          type: 'error',
+        });
       });
 
       server.on('close', code => {
-        console.log(`[${serverName}] Server exited with code ${code}`);
-        this.servers.delete(serverName);
+        log(`[${serverName}] Server exited with code ${code}`, undefined, {
+          type: 'info',
+        });
+        this.runningServers.delete(serverName);
       });
 
       // Store server reference
-      this.servers.set(serverName, { process: server, port, mode: 'http' });
+      this.runningServers.set(serverName, {
+        ...serverConfig,
+        process: server,
+        port,
+        mode: 'http',
+        startTime: Date.now(),
+      });
 
-      // Wait for server to be ready
-      const isReady = await this.waitForServer(port);
+      // Wait for server to be ready with shorter timeout
+      const isReady = await this.waitForServer(port, 15);
       if (!isReady) {
-        console.error(
-          `Failed to start ${serverName} server. Server output:\n${serverOutput}`
+        log(
+          `Failed to start ${serverName} server. Server output:\n${serverOutput}`,
+          undefined,
+          { type: 'error' }
         );
         await this.stopServer(serverName);
         return false;
       }
 
-      console.log(`${serverName} server started successfully on port ${port}`);
+      log(
+        `${serverName} server started successfully on port ${port}`,
+        undefined,
+        { type: 'info' }
+      );
       return true;
     } catch (error) {
-      console.error(`Failed to start HTTP server ${serverName}:`, error);
+      log(`Failed to start HTTP server ${serverName}`, error, {
+        type: 'error',
+      });
       return false;
     }
   }
 
   private async startSseServer(
     serverName: string,
-    serverConfig: ServerConfig
-  ): Promise<boolean> {
-    if (!serverConfig.sseOptions?.endpoint) {
-      console.error(`SSE endpoint not configured for ${serverName}`);
-      return false;
-    }
-
+    serverConfig: RunningServer
+  ): Promise<void> {
     try {
-      console.log(`Starting ${serverName} in SSE mode...`);
+      // Validate SSE configuration
+      if (!serverConfig.sseOptions?.endpoint) {
+        throw new Error(`SSE endpoint not configured for server ${serverName}`);
+      }
+
+      log(`Starting ${serverName} in SSE mode...`, undefined, { type: 'info' });
+
+      // Create EventSource with proper configuration
       const eventSourceInit: CustomEventSourceInit = {
         headers: serverConfig.sseOptions.headers,
       };
+
       const eventSource = new EventSource(
         serverConfig.sseOptions.endpoint,
         eventSourceInit
       );
 
-      eventSource.onopen = () => {
-        console.log(`SSE connection established for ${serverName}`);
-      };
-
-      eventSource.onerror = error => {
-        console.error(`SSE error for ${serverName}:`, error);
-        this.servers.delete(serverName);
-      };
-
-      // Store server reference
-      this.servers.set(serverName, {
-        process: null,
-        port: -1,
-        mode: 'sse',
-        sseClient: eventSource,
+      // Set up connection timeout
+      const connectionTimeout = new Promise<void>((_, reject) => {
+        setTimeout(() => {
+          eventSource.close();
+          reject(
+            new Error(
+              `SSE connection timeout for ${serverName} after 10 seconds`
+            )
+          );
+        }, 10000);
       });
 
-      return true;
+      // Wait for connection or timeout
+      await Promise.race([
+        new Promise<void>(resolve => {
+          eventSource.onopen = () => {
+            log(`SSE connection opened for ${serverName}`, undefined, {
+              type: 'info',
+            });
+            resolve();
+          };
+        }),
+        connectionTimeout,
+      ]);
+
+      // Set up error handling with reconnection logic
+      const reconnectTimeout = serverConfig.sseOptions.reconnectTimeout || 5000;
+      let reconnectAttempt = 0;
+      const maxReconnectAttempts = 3;
+
+      eventSource.onerror = async error => {
+        log(`SSE error for ${serverName}:`, error, { type: 'error' });
+        eventSource.close();
+
+        if (reconnectAttempt < maxReconnectAttempts) {
+          reconnectAttempt++;
+          log(
+            `SSE connection error for ${serverName}, attempting reconnect ${reconnectAttempt}/${maxReconnectAttempts}`,
+            undefined,
+            { type: 'info' }
+          );
+          await new Promise(resolve => setTimeout(resolve, reconnectTimeout));
+          await this.startSseServer(serverName, serverConfig);
+        } else {
+          log(
+            `SSE connection failed for ${serverName} after ${maxReconnectAttempts} reconnect attempts`,
+            undefined,
+            { type: 'error' }
+          );
+          this.runningServers.delete(serverName);
+        }
+      };
+
+      // Store server reference with EventSource
+      const runningServer: RunningServer = {
+        ...serverConfig,
+        process: undefined,
+        port: -1,
+        mode: 'sse',
+        startTime: Date.now(),
+      };
+
+      this.runningServers.set(serverName, runningServer);
+      log(`[${serverName}] Server registered in SSE mode`, undefined, {
+        type: 'info',
+      });
     } catch (error) {
-      console.error(`Failed to start SSE server ${serverName}:`, error);
+      log(`Failed to start SSE server ${serverName}`, error, { type: 'error' });
+      throw error;
+    }
+  }
+
+  public async startAllServers(): Promise<Map<string, boolean>> {
+    const results = new Map<string, boolean>();
+    const startupPromises: Promise<void>[] = [];
+
+    for (const [serverName, serverConfig] of Object.entries(
+      this.config.mcpServers
+    )) {
+      if (serverConfig.disabled) {
+        log(`Server ${serverName} is disabled, skipping...`, undefined, {
+          type: 'info',
+        });
+        results.set(serverName, false);
+        continue;
+      }
+
+      if (this.runningServers.has(serverName)) {
+        log(`Server ${serverName} is already running`, undefined, {
+          type: 'info',
+        });
+        results.set(serverName, true);
+        continue;
+      }
+
+      startupPromises.push(
+        this.startServer(serverName).then(success => {
+          results.set(serverName, success);
+        })
+      );
+    }
+
+    await Promise.allSettled(startupPromises);
+    return results;
+  }
+
+  public async startServer(serverName: string): Promise<boolean> {
+    const serverConfig = this.getServerInfo(serverName);
+    if (!serverConfig) {
+      log(`Server ${serverName} not found in configuration`, undefined, {
+        type: 'error',
+      });
+      return false;
+    }
+
+    if (this.isServerRunning(serverName)) {
+      log(`Server ${serverName} is already running`, undefined, {
+        type: 'debug',
+      });
+      return true;
+    }
+
+    try {
+      // Check if server is already starting
+      const existingPromise = this.startupPromises.get(serverName);
+      if (existingPromise) {
+        log(
+          `Server ${serverName} is already starting, waiting for completion`,
+          undefined,
+          { type: 'debug' }
+        );
+        return existingPromise;
+      }
+
+      // Create startup promise
+      const startupPromise = new Promise<boolean>(resolve => {
+        void (async () => {
+          try {
+            log(`Starting server ${serverName}...`, undefined, {
+              type: 'debug',
+            });
+
+            const runningServer: RunningServer = {
+              ...serverConfig,
+              startTime: Date.now(),
+            };
+
+            // Start server based on mode
+            switch (serverConfig.mode) {
+              case 'http':
+                await this.startHttpServer(serverName, runningServer);
+                break;
+              case 'sse':
+                await this.startSseServer(serverName, runningServer);
+                break;
+              case 'stdio':
+                await this.startStdioServer(serverName, runningServer);
+                break;
+              default:
+                throw new Error(
+                  `Unsupported server mode: ${serverConfig.mode}`
+                );
+            }
+
+            // Wait for server to be ready
+            const isReady = await this.waitForServerReady(
+              serverName,
+              runningServer
+            );
+            if (!isReady) {
+              throw new Error(`Server ${serverName} failed health check`);
+            }
+
+            this.runningServers.set(serverName, runningServer);
+            log(`Server ${serverName} started successfully`, undefined, {
+              type: 'debug',
+            });
+            resolve(true);
+          } catch (error) {
+            log(`Failed to start server ${serverName}`, error, {
+              type: 'error',
+            });
+            resolve(false);
+          } finally {
+            this.startupPromises.delete(serverName);
+          }
+        })();
+      });
+
+      this.startupPromises.set(serverName, startupPromise);
+      return startupPromise;
+    } catch (error) {
+      log(`Error starting server ${serverName}`, error, { type: 'error' });
       return false;
     }
   }
 
-  public async startServer(serverName: string): Promise<boolean> {
-    if (!this.config) {
-      throw new Error('Configuration not loaded');
+  private async waitForServerReady(
+    serverName: string,
+    serverConfig: RunningServer
+  ): Promise<boolean> {
+    const maxAttempts = 30;
+    const retryDelay = 1000;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const isHealthy = await this.checkServerHealth(
+          serverName,
+          serverConfig
+        );
+        if (isHealthy) {
+          return true;
+        }
+
+        if (attempt < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+        }
+      } catch (error) {
+        log(
+          `Health check failed for ${serverName} (attempt ${attempt}/${maxAttempts})`,
+          error,
+          { type: 'debug' }
+        );
+        if (attempt === maxAttempts) {
+          return false;
+        }
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+      }
     }
 
-    const serverConfig = this.config.mcpServers[serverName];
-    if (!serverConfig) {
-      throw new Error(`Server ${serverName} not found in configuration`);
-    }
+    return false;
+  }
 
-    // Skip disabled servers
-    if (serverConfig.disabled) {
-      console.log(`Server ${serverName} is disabled, skipping...`);
-      return false;
-    }
-
-    // Check if server is already running
-    if (this.servers.has(serverName)) {
-      console.log(`Server ${serverName} is already running`);
-      return true;
-    }
-
-    console.log(
-      `Starting server ${serverName} in ${serverConfig.mode} mode...`
-    );
+  private async checkServerHealth(
+    serverName: string,
+    serverConfig: RunningServer
+  ): Promise<boolean> {
     try {
-      let success = false;
       switch (serverConfig.mode) {
-        case 'stdio':
-          success = await this.startStdioServer(serverName, serverConfig);
-          break;
-        case 'http':
-          success = await this.startHttpServer(serverName, serverConfig);
-          break;
-        case 'sse':
-          success = await this.startSseServer(serverName, serverConfig);
-          break;
+        case 'http': {
+          const port = serverConfig.port || 3004;
+          const response = await fetch(`http://localhost:${port}/health`);
+          return response.ok;
+        }
+        case 'sse': {
+          const port = serverConfig.port || 3005;
+          const response = await fetch(`http://localhost:${port}/health`);
+          return response.ok;
+        }
+        case 'stdio': {
+          // For stdio servers, we consider them healthy if they're running
+          return true;
+        }
         default:
-          throw new Error(`Unsupported server mode: ${serverConfig.mode}`);
+          return false;
       }
-
-      if (success) {
-        console.log(`Server ${serverName} started and registered successfully`);
-      } else {
-        console.error(`Failed to start server ${serverName}`);
-      }
-
-      return success;
     } catch (error) {
-      console.error(`Failed to start server ${serverName}:`, error);
       return false;
     }
   }
 
   public async stopServer(serverName: string): Promise<void> {
-    const server = this.servers.get(serverName);
-    if (!server) {
+    const serverInfo = this.runningServers.get(serverName);
+    if (!serverInfo) {
       return;
     }
 
     try {
-      switch (server.mode) {
-        case 'stdio':
-        case 'http':
-          if (server.process) {
-            server.process.kill();
-            await new Promise<void>(resolve => {
-              if (server.process) {
-                server.process.on('exit', () => resolve());
-              } else {
-                resolve();
-              }
-            });
-          }
-          break;
-        case 'sse':
-          if (server.sseClient) {
-            server.sseClient.close();
-          }
-          break;
+      if (serverInfo.process) {
+        serverInfo.process.kill();
       }
+      this.runningServers.delete(serverName);
+      log(`Server ${serverName} stopped`, undefined, { type: 'info' });
     } catch (error) {
-      console.error(`Error stopping server ${serverName}:`, error);
-    } finally {
-      this.servers.delete(serverName);
-      console.log(`Server ${serverName} stopped successfully`);
+      log(`Error stopping server ${serverName}`, error, { type: 'error' });
     }
   }
 
   public async stopAllServers(): Promise<void> {
-    const serverNames = Array.from(this.servers.keys());
+    const serverNames = Array.from(this.runningServers.keys());
     await Promise.all(serverNames.map(name => this.stopServer(name)));
   }
 
   public isServerRunning(serverName: string): boolean {
-    return this.servers.has(serverName);
+    return this.runningServers.has(serverName);
   }
 
   public getRunningServers(): string[] {
-    return Array.from(this.servers.keys());
+    return Array.from(this.runningServers.keys());
   }
 }

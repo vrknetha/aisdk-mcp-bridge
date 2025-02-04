@@ -9,6 +9,7 @@ build/
 
 # Testing
 coverage/
+mcp.config.json
 
 # Environment variables
 .env

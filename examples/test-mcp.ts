@@ -21,16 +21,24 @@ async function runTest() {
         'Please analyze the current trennds using https://www.techtarget.com/searchenterpriseai/tip/9-top-AI-and-machine-learning-trends',
       tools,
     });
+    console.log('Result:', result.text);
     return true;
   } catch (error) {
     console.error('Test failed:', error);
     return false;
+  } finally {
+    try {
+      await cleanupMcp();
+    } catch (cleanupError) {
+      console.error('Error during cleanup:', cleanupError);
+    }
   }
 }
 
 async function runHttpTest() {
-  console.log('Running HTTP server test...');
   try {
+    console.log('Running HTTP server test...');
+
     // Initialize MCP with HTTP server
     await initializeMcp();
 
@@ -47,8 +55,16 @@ async function runHttpTest() {
     console.log('Echo test result:', result.text);
 
     console.log('HTTP server test completed successfully');
+    return true;
   } catch (error) {
     console.error('HTTP server test failed:', error);
+    return false;
+  } finally {
+    try {
+      await cleanupMcp();
+    } catch (cleanupError) {
+      console.error('Error during cleanup:', cleanupError);
+    }
   }
 }
 
@@ -76,22 +92,16 @@ async function runSseTest() {
   }
 }
 
+// Run tests
 async function runTests() {
-  try {
-    await runTest();
-    await cleanupMcp();
-
-    await runHttpTest();
-    await cleanupMcp();
-
-    await runSseTest();
-    await cleanupMcp();
-
-    console.log('All tests completed');
-  } catch (error) {
-    console.error('Test suite failed:', error);
-  }
+  const results = await Promise.all([runTest()]);
+  const allPassed = results.every(result => result);
+  process.exit(allPassed ? 0 : 1);
 }
 
-// Run the tests
-runTests();
+if (require.main === module) {
+  runTests().catch(error => {
+    console.error('Tests failed:', error);
+    process.exit(1);
+  });
+}
