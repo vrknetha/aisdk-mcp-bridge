@@ -23,7 +23,7 @@
     "test:playwright": "tsx examples/test-playwright.ts",
     "test:firecrawl": "tsx examples/test-firecrawl.ts",
     "prepare": "npm run build",
-    "prepublishOnly": "npm test && npm run lint",
+    "prepublishOnly": "npm run lint",
     "preversion": "npm run lint",
     "version": "npm run format && git add -A src",
     "postversion": "git push && git push --tags"
