@@ -9,8 +9,6 @@ import {
   ListToolsResultSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { JSONSchema7 } from 'json-schema';
-import fs from 'fs';
-import path from 'path';
 import * as z from 'zod';
 
 export interface MCPToolResult {

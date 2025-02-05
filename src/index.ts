@@ -18,10 +18,7 @@ export type { MCPServersConfig as MCPConfig } from './server';
 export type { ServerConfig } from './server';
 export type { MCPToolResult } from './service';
 
-// Configuration validation schema
-const AutoApproveSchema = z.array(z.string()).default([]);
-
-// Helper to convert ServerConfig to StdioServerParameters
+// Helper to convert ServerConfig to StdioServerParameters (internal use only)
 export function toStdioParams(config: ServerConfig): StdioServerParameters {
   // Ensure PATH includes common binary locations
   const envPath = process.env.PATH || '';
@@ -30,17 +27,17 @@ export function toStdioParams(config: ServerConfig): StdioServerParameters {
     '/usr/bin',
     '/bin',
     '/opt/homebrew/bin',
-    './node_modules/.bin', // Add local node_modules bin
+    './node_modules/.bin',
   ].join(':');
 
   return {
     command: config.command,
     args: config.args,
     env: {
-      ...process.env, // Include all process environment variables
+      ...process.env,
       NODE_ENV: process.env.NODE_ENV || 'development',
-      PATH: `${envPath}:${additionalPaths}`, // Extend PATH with additional locations
-      ...config.env, // Override with config environment variables
+      PATH: `${envPath}:${additionalPaths}`,
+      ...config.env,
     },
     stderr: 'inherit',
   };
@@ -256,12 +253,71 @@ export async function cleanupMcp(): Promise<void> {
   try {
     log('Cleaning up MCP resources...', undefined, { debug: true });
     const service = MCPService.getInstance();
-    await service.cleanup();
-    log('MCP cleanup complete', undefined, { debug: true });
+
+    let cleanupComplete = false;
+    const cleanupTimeout = setTimeout(() => {
+      if (!cleanupComplete) {
+        log('Cleanup timeout reached, forcing exit...', undefined, {
+          type: 'error',
+        });
+        process.exit(1);
+      }
+    }, 15000);
+
+    try {
+      await service.cleanup();
+      log('MCP cleanup complete', undefined, { debug: true });
+
+      // Clear any remaining intervals/timeouts
+      const intervalIds = getIntervalIds();
+      intervalIds.forEach(clearInterval);
+      const timeoutIds = getTimeoutIds();
+      timeoutIds.forEach(clearTimeout);
+
+      cleanupComplete = true;
+      clearTimeout(cleanupTimeout);
+
+      // Give a small delay for final cleanup operations
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      process.exit(0);
+    } catch (error) {
+      log('Cleanup failed', error, { type: 'error' });
+      process.exit(1);
+    }
   } catch (error) {
     log('Failed to clean up MCP resources', error, { type: 'error' });
-    throw error;
+    process.exit(1);
   }
+}
+
+// Helper function to get all active interval IDs
+function getIntervalIds(): NodeJS.Timeout[] {
+  const ids: NodeJS.Timeout[] = [];
+  const originalSetInterval = global.setInterval;
+  global.setInterval = function (
+    callback: () => void,
+    ms?: number
+  ): NodeJS.Timeout {
+    const id = originalSetInterval(callback, ms);
+    ids.push(id);
+    return id;
+  } as typeof global.setInterval;
+  return ids;
+}
+
+// Helper function to get all active timeout IDs
+function getTimeoutIds(): NodeJS.Timeout[] {
+  const ids: NodeJS.Timeout[] = [];
+  const originalSetTimeout = global.setTimeout;
+  global.setTimeout = function (
+    callback: () => void,
+    ms?: number
+  ): NodeJS.Timeout {
+    const id = originalSetTimeout(callback, ms);
+    ids.push(id);
+    return id;
+  } as typeof global.setTimeout;
+  return ids;
 }
 
 // Export configuration types and utilities

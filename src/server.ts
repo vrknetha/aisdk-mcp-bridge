@@ -92,18 +92,8 @@ export class MCPServerManager {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
-      let serverOutput = '';
-      server.stdout.on('data', data => {
-        serverOutput += data.toString();
-        log(`[${serverName}] ${data.toString()}`, undefined, { type: 'info' });
-      });
-
-      server.stderr.on('data', data => {
-        serverOutput += data.toString();
-        log(`[${serverName}] Error: ${data.toString()}`, undefined, {
-          type: 'error',
-        });
-      });
+      // Handle server output
+      this.setupServerLogging(server, serverName);
 
       server.on('close', code => {
         log(`[${serverName}] Server exited with code ${code}`, undefined, {
@@ -181,12 +171,8 @@ export class MCPServerManager {
           stdio: ['ignore', 'pipe', 'pipe'],
         });
 
-        let serverOutput = '';
-        server.stdout.on('data', data => {
-          const output = data.toString();
-          serverOutput += output;
-          log(`[${serverName}] ${output}`, undefined, { type: 'info' });
-
+        // Handle server output
+        this.setupServerLogging(server, serverName, output => {
           // Check for server ready message
           if (output.includes('SSE server ready on port')) {
             isReady = true;
@@ -202,13 +188,6 @@ export class MCPServerManager {
 
             resolve(true);
           }
-        });
-
-        server.stderr.on('data', data => {
-          serverOutput += data.toString();
-          log(`[${serverName}] Error: ${data.toString()}`, undefined, {
-            type: 'error',
-          });
         });
 
         server.on('close', code => {
@@ -256,6 +235,31 @@ export class MCPServerManager {
         type: 'error',
       });
       return false;
+    }
+  }
+
+  // Helper method to set up server output logging
+  private setupServerLogging(
+    server: ChildProcess,
+    serverName: string,
+    onOutput?: (output: string) => void
+  ): void {
+    if (server.stdout) {
+      server.stdout.on('data', data => {
+        const output = data.toString();
+        log(`[${serverName}] ${output}`, undefined, { type: 'info' });
+        onOutput?.(output);
+      });
+    }
+
+    if (server.stderr) {
+      server.stderr.on('data', data => {
+        const output = data.toString();
+        log(`[${serverName}] Error: ${output}`, undefined, {
+          type: 'error',
+        });
+        onOutput?.(output);
+      });
     }
   }
 
@@ -343,7 +347,7 @@ export class MCPServerManager {
       }
 
       // Create startup promise
-      const startupPromise = new Promise<boolean>((resolve, reject) => {
+      const startupPromise = new Promise<boolean>(resolve => {
         try {
           log(`Starting server ${serverName}...`, undefined, {
             type: 'debug',
@@ -368,7 +372,7 @@ export class MCPServerManager {
               log(`Failed to start server ${serverName}`, error, {
                 type: 'error',
               });
-              resolve(false); // Resolve with false instead of rejecting
+              resolve(false);
             })
             .finally(() => {
               this.startupPromises.delete(serverName);
@@ -378,7 +382,7 @@ export class MCPServerManager {
             type: 'error',
           });
           this.startupPromises.delete(serverName);
-          resolve(false); // Resolve with false instead of rejecting
+          resolve(false);
         }
       });
 
@@ -398,7 +402,35 @@ export class MCPServerManager {
 
     try {
       if (serverInfo.process) {
-        serverInfo.process.kill();
+        // Force kill after timeout if process doesn't exit gracefully
+        const killTimeout = setTimeout(() => {
+          try {
+            if (serverInfo.process) {
+              serverInfo.process.kill('SIGKILL');
+            }
+          } catch (error) {
+            log(`Error force killing server ${serverName}`, error, {
+              type: 'error',
+            });
+          }
+        }, 5000);
+
+        // Try graceful shutdown first
+        serverInfo.process.kill('SIGTERM');
+
+        // Wait for process to exit
+        await new Promise<void>(resolve => {
+          if (!serverInfo.process) {
+            clearTimeout(killTimeout);
+            resolve();
+            return;
+          }
+
+          serverInfo.process.once('exit', () => {
+            clearTimeout(killTimeout);
+            resolve();
+          });
+        });
       }
       this.runningServers.delete(serverName);
       log(`Server ${serverName} stopped`, undefined, { type: 'info' });
@@ -413,10 +445,30 @@ export class MCPServerManager {
     const stopPromises = serverNames.map(name =>
       this.stopServer(name).catch(error => {
         log(`Error stopping server ${name}`, error, { type: 'error' });
-        // Don't rethrow - allow other servers to stop
       })
     );
-    await Promise.allSettled(stopPromises);
+
+    try {
+      // Wait for all servers to stop with timeout
+      const timeoutPromise = new Promise<void>(resolve =>
+        setTimeout(resolve, 10000)
+      );
+      await Promise.race([Promise.all(stopPromises), timeoutPromise]);
+    } finally {
+      // Force kill any remaining processes
+      for (const [name, server] of this.runningServers.entries()) {
+        try {
+          if (server.process && !server.process.killed) {
+            server.process.kill('SIGKILL');
+            log(`Force killed server ${name}`, undefined, { type: 'info' });
+          }
+        } catch (error) {
+          log(`Error force killing server ${name}`, error, { type: 'error' });
+        }
+      }
+      // Clear all server references
+      this.runningServers.clear();
+    }
   }
 
   public isServerRunning(serverName: string): boolean {
