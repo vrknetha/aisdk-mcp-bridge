@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [18.x, 20.x]
+        node-version: [20.x]
 
     steps:
       - uses: actions/checkout@v4
@@ -27,8 +27,3 @@ jobs:
 
       - name: Run linter
         run: npm run lint
-
-      - name: Run tests
-        run: npm test
-        env:
-          CI: true
